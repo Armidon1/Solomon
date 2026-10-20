@@ -39,11 +39,11 @@ async function readBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+// Requests run concurrently: the runner gives each conversation its own session, so a title or
+// subagent request never waits behind, or replaces, a chat that is mid tool call.
 export function createSidecar(token: string, runner: Runner) {
-  let tail = Promise.resolve();
   return createServer((req, res) => {
-    tail = tail.then(() => handle(req, res, token, runner)).catch(() => undefined);
-    return tail;
+    void handle(req, res, token, runner);
   });
 }
 

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ var (
 
 type sidecar struct {
 	cmd   *exec.Cmd
+	stdin io.WriteCloser
 	base  string
 	token string
 	cwd   string
@@ -51,14 +53,13 @@ func Ensure(ctx context.Context, cwd string) (baseURL, token string, err error) 
 		return running.base, running.token, nil
 	}
 	stopLocked()
-	dir, err := sourceDir()
+	dir, err := sourceDir(ctx)
 	if err != nil {
 		return "", "", err
 	}
-	if _, err := os.Stat(filepath.Join(dir, "node_modules", "@anthropic-ai", "claude-agent-sdk")); err != nil {
-		if err := npmCI(ctx, dir); err != nil {
-			return "", "", err
-		}
+	node, err := nodeExecutable()
+	if err != nil {
+		return "", "", err
 	}
 	cli := installedCLI()
 	if cli == "" {
@@ -71,15 +72,20 @@ func Ensure(ctx context.Context, cwd string) (baseURL, token string, err error) 
 	if err != nil {
 		return "", "", err
 	}
-	cmd := exec.Command("node", "--experimental-strip-types", filepath.Join(dir, "src", "index.ts"))
+	cmd := exec.Command(node, "--experimental-strip-types", filepath.Join(dir, "src", "index.ts"))
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(withNodePath(cliEnv(), node),
 		"SOLOMON_CLAUDE_TOKEN="+token,
 		"SOLOMON_CLAUDE_PORT=0",
 		"SOLOMON_CLAUDE_CWD="+cwd,
 		"SOLOMON_CLAUDE_EXECUTABLE="+cli,
 	)
 	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", "", err
+	}
+	// The sidecar exits when this pipe closes, so it never outlives Solomon, even after a crash.
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return "", "", err
 	}
@@ -104,7 +110,7 @@ func Ensure(ctx context.Context, cwd string) (baseURL, token string, err error) 
 		_ = killProcess(cmd)
 		return "", "", err
 	}
-	running = &sidecar{cmd: cmd, base: base, token: token, cwd: cwd}
+	running = &sidecar{cmd: cmd, stdin: stdin, base: base, token: token, cwd: cwd}
 	go func(cmd *exec.Cmd) {
 		_ = cmd.Wait()
 		mu.Lock()
@@ -114,6 +120,74 @@ func Ensure(ctx context.Context, cwd string) (baseURL, token string, err error) 
 		mu.Unlock()
 	}(cmd)
 	return base, token, nil
+}
+
+// Models lists the model IDs the official SDK offers to the logged-in subscription.
+func Models(ctx context.Context, cwd string) ([]string, error) {
+	base, token, err := Ensure(ctx, cwd)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("Claude sidecar models: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Claude sidecar models: %s", strings.TrimSpace(body.Error.Message))
+	}
+	ids := make([]string, 0, len(body.Data))
+	for _, model := range body.Data {
+		ids = append(ids, model.ID)
+	}
+	return ids, nil
+}
+
+// AccessToken reads the CLI's current subscription token without refreshing it;
+// refresh tokens rotate, so only the CLI may spend them. It is empty when the CLI
+// keeps credentials elsewhere (for example the macOS keychain) or the token expired.
+func AccessToken() string {
+	dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".claude")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".credentials.json"))
+	if err != nil {
+		return ""
+	}
+	var creds struct {
+		OAuth struct {
+			AccessToken string `json:"accessToken"`
+			ExpiresAt   int64  `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(data, &creds) != nil {
+		return ""
+	}
+	if creds.OAuth.ExpiresAt > 0 && time.Now().After(time.UnixMilli(creds.OAuth.ExpiresAt)) {
+		return ""
+	}
+	return creds.OAuth.AccessToken
 }
 
 func stopLocked() {
@@ -167,12 +241,14 @@ func health(ctx context.Context, base, token string) error {
 	return nil
 }
 
-func sourceDir() (string, error) {
+// sourceDir prefers an explicit or repository checkout, so development runs the
+// live sources, and otherwise uses the copy embedded in this binary.
+func sourceDir(ctx context.Context) (string, error) {
 	if dir := strings.TrimSpace(os.Getenv("SOLOMON_CLAUDE_SIDECAR_DIR")); dir != "" {
 		if _, err := os.Stat(filepath.Join(dir, "src", "index.ts")); err != nil {
 			return "", fmt.Errorf("Claude sidecar sources missing in %s", dir)
 		}
-		return dir, nil
+		return dir, ensureModules(ctx, dir)
 	}
 	starts := []string{}
 	if wd, err := os.Getwd(); err == nil {
@@ -186,7 +262,7 @@ func sourceDir() (string, error) {
 		for i := 0; i < 8; i++ {
 			candidate := filepath.Join(dir, "integrations", "claude")
 			if _, err := os.Stat(filepath.Join(candidate, "src", "index.ts")); err == nil {
-				return candidate, nil
+				return candidate, ensureModules(ctx, candidate)
 			}
 			parent := filepath.Dir(dir)
 			if parent == dir {
@@ -195,13 +271,63 @@ func sourceDir() (string, error) {
 			dir = parent
 		}
 	}
-	return "", fmt.Errorf("Claude sidecar sources not found")
+	return runtimeDir(ctx)
+}
+
+func ensureModules(ctx context.Context, dir string) error {
+	if _, err := os.Stat(filepath.Join(dir, "node_modules", "@anthropic-ai", "claude-agent-sdk")); err == nil {
+		return nil
+	}
+	return npmCI(ctx, dir)
+}
+
+// nodeExecutable also checks common install locations, since desktop apps
+// launched from a GUI session (notably on macOS) miss the shell's PATH.
+func nodeExecutable() (string, error) {
+	if path := strings.TrimSpace(os.Getenv("SOLOMON_NODE")); path != "" {
+		return path, nil
+	}
+	if path, err := exec.LookPath("node"); err == nil {
+		return path, nil
+	}
+	home, _ := os.UserHomeDir()
+	for _, path := range []string{"/opt/homebrew/bin/node", "/usr/local/bin/node", filepath.Join(home, ".volta", "bin", "node"), filepath.Join(home, ".local", "bin", "node")} {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("Node.js 22.18 or newer is required for Claude Sub: node not found in PATH")
+}
+
+// withNodePath puts node's directory first in PATH so npm and its scripts find it.
+func withNodePath(env []string, node string) []string {
+	dir := filepath.Dir(node)
+	for i, entry := range env {
+		if key, value, ok := strings.Cut(entry, "="); ok && strings.EqualFold(key, "PATH") {
+			env[i] = key + "=" + dir + string(os.PathListSeparator) + value
+			return env
+		}
+	}
+	return append(env, "PATH="+dir)
 }
 
 func npmCI(ctx context.Context, dir string) error {
-	cmd := exec.CommandContext(ctx, "npm", "ci", "--no-audit", "--no-fund")
+	node, err := nodeExecutable()
+	if err != nil {
+		return err
+	}
+	npm, err := exec.LookPath("npm")
+	if err != nil {
+		npm = filepath.Join(filepath.Dir(node), "npm")
+		if runtime.GOOS == "windows" {
+			npm += ".cmd"
+		}
+	}
+	cmd := exec.CommandContext(ctx, npm, "ci", "--no-audit", "--no-fund")
 	cmd.Dir = dir
+	cmd.Env = withNodePath(os.Environ(), node)
 	configureProcess(cmd)
+	cmd.Cancel = func() error { return killProcess(cmd) }
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("install Claude sidecar: %w: %s", err, strings.TrimSpace(string(out)))

@@ -1,14 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { nextAction, type ChatMessage, type ToolCall } from "./history.ts";
+import { nextAction, type Action, type ChatMessage, type ToolCall } from "./history.ts";
 import type { Completion, ToolDefinition } from "./server.ts";
 
-type Session = {
-  query: AsyncIterable<Record<string, any>> & { supportedModels(): Promise<Array<{ value: string }>>; return(value?: unknown): Promise<unknown> };
-  input: PushStream<Record<string, unknown>>;
-  abort: AbortController;
-};
+type Query = AsyncIterable<Record<string, any>> & { supportedModels(): Promise<Array<{ value: string; resolvedModel?: string }>>; return(value?: unknown): Promise<unknown> };
+type Event = { kind: "sdk"; message: Record<string, any> } | { kind: "tool"; call: ToolCall };
+
+const maxSessions = 8;
+const idleMs = 30 * 60 * 1000;
 
 class PushStream<T> {
   private items: T[] = [];
@@ -64,44 +64,49 @@ function schemaFor(parameters: unknown) {
   return z.object(shape).passthrough();
 }
 
-function fresh(messages: ChatMessage[]): boolean {
-  const body = messages.filter((message) => message.role !== "system");
-  return body.length === 1 && body[0].role === "user";
+function options(executable: string, model: string, system: string, abort: AbortController) {
+  return {
+    model: model || undefined,
+    cwd: process.env.SOLOMON_CLAUDE_CWD || process.cwd(),
+    abortController: abort,
+    tools: [] as string[],
+    skills: [] as string[],
+    settingSources: [] as Array<"user" | "project" | "local">,
+    permissionMode: "default" as const,
+    persistSession: false,
+    pathToClaudeCodeExecutable: executable || undefined,
+    systemPrompt: system ? { type: "preset" as const, preset: "claude_code" as const, append: system } : { type: "preset" as const, preset: "claude_code" as const },
+    env: childEnv(),
+    disallowedTools: ["Bash", "Read", "Edit", "Write", "Grep", "Glob", "WebFetch", "WebSearch", "Task", "Skill", "NotebookEdit"],
+    canUseTool: async (name: string) => name.startsWith("mcp__solomon__") ? { behavior: "allow" as const } : { behavior: "deny" as const, message: "Solomon executes this tool" },
+  };
 }
 
-export class ClaudeRunner {
+function user(prompt: string) { return { type: "user", message: { role: "user", content: prompt }, parent_tool_use_id: null }; }
+
+// LiveSession is one official SDK conversation. Like the Cursor sidecar's per-request agents,
+// sessions share no state, so title generation or a subagent never disturbs a chat that is
+// waiting on Solomon's tool results.
+class LiveSession {
+  readonly model: string;
+  accepted: ChatMessage[] = [];
+  produced: { content: string; tools: ToolCall[] } | null = null;
+  busy = false;
+  used = Date.now();
   private executable: string;
-  private session: Session | null = null;
-  private accepted: ChatMessage[] = [];
-  private produced: { content: string; tools: ToolCall[] } | null = null;
-  private events = new PushStream<{ kind: "sdk"; message: Record<string, any> } | { kind: "tool"; call: ToolCall }>();
+  private live: Query | null = null;
+  private input = new PushStream<Record<string, unknown>>();
+  private abort = new AbortController();
+  private events = new PushStream<Event>();
   private pending = new Map<string, (output: string) => void>();
-  private modelNames: string[] | null = null;
-  constructor(executable: string) { this.executable = executable; }
-  async models(): Promise<string[]> {
-    if (this.modelNames) return this.modelNames;
-    const input = new PushStream<Record<string, unknown>>();
-    const abort = new AbortController();
-    const live = query({ prompt: input as AsyncIterable<any>, options: this.options("", "", abort) }) as Session["query"];
-    try {
-      const models = await Promise.race([live.supportedModels(), new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Claude model discovery timed out")), 30000))]);
-      this.modelNames = models.map((model) => model.value).filter(Boolean);
-      return this.modelNames;
-    } finally {
-      abort.abort();
-      input.end();
-      await live.return();
-    }
+  constructor(executable: string, model: string) {
+    this.executable = executable;
+    this.model = model;
   }
-  async complete(input: { model: string; messages: ChatMessage[]; tools: ToolDefinition[] }, onDelta: (text: string) => void, signal: AbortSignal): Promise<Completion> {
-    let action = nextAction(this.accepted, this.produced, input.messages);
-    if (action.type === "reject" && fresh(input.messages)) {
-      await this.close();
-      action = nextAction(this.accepted, this.produced, input.messages);
-    }
+  async complete(action: Action, messages: ChatMessage[], tools: ToolDefinition[], onDelta: (text: string) => void, signal: AbortSignal): Promise<Completion> {
     if (action.type === "reject") throw new Error(action.reason);
-    if (action.type === "start") await this.start(input.model, action.system, action.prompt, input.tools);
-    if (action.type === "user") this.session?.input.push(this.user(action.prompt));
+    if (action.type === "start") this.start(action.system, action.prompt, tools);
+    if (action.type === "user") this.input.push(user(action.prompt));
     if (action.type === "tools") {
       for (const result of action.results) {
         const resolve = this.pending.get(result.id);
@@ -111,14 +116,11 @@ export class ClaudeRunner {
       }
     }
     const completion = await this.read(onDelta, signal);
-    this.accepted = input.messages;
+    this.accepted = messages;
     this.produced = { content: completion.content, tools: completion.toolCalls };
     return completion;
   }
-  private async start(model: string, system: string, prompt: string, tools: ToolDefinition[]) {
-    await this.close();
-    const abort = new AbortController();
-    const input = new PushStream<Record<string, unknown>>();
+  private start(system: string, prompt: string, tools: ToolDefinition[]) {
     const definitions = tools.flatMap((entry) => {
       const name = entry.function?.name || "";
       if (!name) return [];
@@ -131,16 +133,16 @@ export class ClaudeRunner {
         return { content: [{ type: "text" as const, text: output }] };
       })];
     });
-    const live = query({ prompt: input as AsyncIterable<any>, options: { ...this.options(model, system, abort), mcpServers: { solomon: createSdkMcpServer({ name: "solomon", tools: definitions }) }, allowedTools: definitions.map((entry) => "mcp__solomon__" + entry.name) } }) as Session["query"];
-    this.session = { query: live, input, abort };
-    void this.pump(live, this.events);
-    input.push(this.user(prompt));
+    const live = query({ prompt: this.input as AsyncIterable<any>, options: { ...options(this.executable, this.model, system, this.abort), mcpServers: { solomon: createSdkMcpServer({ name: "solomon", tools: definitions }) }, allowedTools: definitions.map((entry) => "mcp__solomon__" + entry.name) } }) as Query;
+    this.live = live;
+    void this.pump(live);
+    this.input.push(user(prompt));
   }
-  private async pump(live: Session["query"], events: PushStream<{ kind: "sdk"; message: Record<string, any> } | { kind: "tool"; call: ToolCall }>) {
+  private async pump(live: Query) {
     try {
-      for await (const message of live) events.push({ kind: "sdk", message: message as Record<string, any> });
+      for await (const message of live) this.events.push({ kind: "sdk", message: message as Record<string, any> });
     } finally {
-      events.end();
+      this.events.end();
     }
   }
   private async read(onDelta: (text: string) => void, signal: AbortSignal): Promise<Completion> {
@@ -161,40 +163,86 @@ export class ClaudeRunner {
         for (const block of message.message?.content || []) if (block.type === "text" && block.text) { content += block.text; onDelta(block.text); }
       }
       if (message.type === "result") {
-        if (message.is_error || (message.subtype && message.subtype !== "success")) throw new Error(message.result || "Claude sidecar request failed");
+        if (message.is_error || (message.subtype && message.subtype !== "success")) {
+          const reason = String(message.result || "Claude sidecar request failed");
+          throw new Error(/not logged in/i.test(reason) ? "Claude Sub is not logged in: run /connect and choose Claude Sub to sign in with the Claude CLI" : reason);
+        }
         return { content, toolCalls: [], finishReason: message.subtype === "success" && message.stop_reason === "max_tokens" ? "length" : "stop", usage: { promptTokens: Number(message.usage?.input_tokens || 0), completionTokens: Number(message.usage?.output_tokens || 0) } };
       }
     }
   }
-  private options(model: string, system: string, abort: AbortController) {
-    return {
-      model: model || undefined,
-      cwd: process.env.SOLOMON_CLAUDE_CWD || process.cwd(),
-      abortController: abort,
-      tools: [] as string[],
-      skills: [] as string[],
-      settingSources: [] as Array<"user" | "project" | "local">,
-      permissionMode: "default" as const,
-      persistSession: false,
-      pathToClaudeCodeExecutable: this.executable || undefined,
-      systemPrompt: system ? { type: "preset" as const, preset: "claude_code" as const, append: system } : { type: "preset" as const, preset: "claude_code" as const },
-      env: childEnv(),
-      disallowedTools: ["Bash", "Read", "Edit", "Write", "Grep", "Glob", "WebFetch", "WebSearch", "Task", "Skill", "NotebookEdit"],
-      canUseTool: async (name: string) => name.startsWith("mcp__solomon__") ? { behavior: "allow" as const } : { behavior: "deny" as const, message: "Solomon executes this tool" },
-    };
-  }
-  private user(prompt: string) { return { type: "user", message: { role: "user", content: prompt }, parent_tool_use_id: null }; }
-  private async close() {
-    const session = this.session;
-    this.session = null;
-    this.accepted = [];
-    this.produced = null;
+  async close() {
     for (const resolve of this.pending.values()) resolve("");
     this.pending.clear();
-    if (!session) return;
-    session.abort.abort();
-    session.input.end();
-    await session.query.return();
-    this.events = new PushStream();
+    this.abort.abort();
+    this.input.end();
+    if (this.live) await this.live.return().catch(() => undefined);
+  }
+}
+
+export class ClaudeRunner {
+  private executable: string;
+  private sessions: LiveSession[] = [];
+  private modelNames: string[] | null = null;
+  constructor(executable: string) { this.executable = executable; }
+  async models(): Promise<string[]> {
+    if (this.modelNames) return this.modelNames;
+    const input = new PushStream<Record<string, unknown>>();
+    const abort = new AbortController();
+    const live = query({ prompt: input as AsyncIterable<any>, options: options(this.executable, "", "", abort) }) as Query;
+    try {
+      const models = await Promise.race([live.supportedModels(), new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Claude model discovery timed out")), 30000))]);
+      // The newest models are listed only as aliases ("opus", "sonnet"); their concrete IDs live in resolvedModel.
+      this.modelNames = [...new Set(models.map((model) => model.resolvedModel || model.value).filter(Boolean))];
+      return this.modelNames;
+    } finally {
+      abort.abort();
+      input.end();
+      await live.return();
+    }
+  }
+  async complete(input: { model: string; messages: ChatMessage[]; tools: ToolDefinition[] }, onDelta: (text: string) => void, signal: AbortSignal): Promise<Completion> {
+    await this.sweep();
+    let session: LiveSession | undefined;
+    let action: Action = nextAction([], null, input.messages);
+    for (const candidate of this.sessions) {
+      if (candidate.busy || candidate.model !== input.model) continue;
+      const next = nextAction(candidate.accepted, candidate.produced, input.messages);
+      if (next.type !== "reject") {
+        session = candidate;
+        action = next;
+        break;
+      }
+    }
+    if (action.type === "reject") throw new Error(action.reason);
+    if (!session) {
+      session = new LiveSession(this.executable, input.model);
+      this.sessions.push(session);
+    }
+    // Claimed before any await, so concurrent requests never share a session.
+    session.busy = true;
+    try {
+      return await session.complete(action, input.messages, input.tools, onDelta, signal);
+    } catch (error) {
+      await this.drop(session);
+      throw error;
+    } finally {
+      session.busy = false;
+      session.used = Date.now();
+    }
+  }
+  async close() {
+    await Promise.all(this.sessions.map((session) => this.drop(session)));
+  }
+  // sweep closes idle sessions and keeps the pool bounded, since each one holds a CLI process.
+  private async sweep() {
+    const now = Date.now();
+    for (const session of this.sessions.filter((entry) => !entry.busy && now - entry.used > idleMs)) await this.drop(session);
+    const idle = this.sessions.filter((entry) => !entry.busy).sort((left, right) => left.used - right.used);
+    while (this.sessions.length >= maxSessions && idle.length) await this.drop(idle.shift()!);
+  }
+  private async drop(session: LiveSession) {
+    this.sessions = this.sessions.filter((entry) => entry !== session);
+    await session.close();
   }
 }
