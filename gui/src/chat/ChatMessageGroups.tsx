@@ -21,9 +21,7 @@ export function ChatMessageGroups({ liveWorkedFor, isWorking = liveWorkedFor !==
   const autoCollapseToolCalls = preferences.chat.autoCloseToolCalls;
   const startToolCallsCollapsed = preferences.chat.startToolCallsCollapsed;
   const groups = groupChatTurns(messages);
-  const lastAssistantGroupIndex = groups.reduce((lastIndex, entries, groupIndex) => (
-    entries[0]?.message.role === "assistant" ? groupIndex : lastIndex
-  ), -1);
+
 
   return (
     <>
@@ -33,7 +31,6 @@ export function ChatMessageGroups({ liveWorkedFor, isWorking = liveWorkedFor !==
 
         if (first.message.role === "assistant") {
           const activeWorkedFor = isWorking && groupIndex === groups.length - 1 ? liveWorkedFor : undefined;
-          const shouldShowWorkedFor = groupIndex === lastAssistantGroupIndex;
           return (
             <AssistantTurn
               preferencesReady={preferencesReady}
@@ -45,7 +42,6 @@ export function ChatMessageGroups({ liveWorkedFor, isWorking = liveWorkedFor !==
               key={first.message.id}
               onOpenSubagent={onOpenSubagent}
               onStopTool={onStopTool}
-              shouldShowWorkedFor={shouldShowWorkedFor}
             />
           );
         }
@@ -89,7 +85,6 @@ const AssistantTurn = memo(function AssistantTurn({
   isWorking,
   onOpenSubagent,
   onStopTool,
-  shouldShowWorkedFor,
 }: {
   preferencesReady: boolean;
   autoCollapseToolCalls: boolean;
@@ -99,7 +94,6 @@ const AssistantTurn = memo(function AssistantTurn({
   isWorking: boolean;
   onOpenSubagent?: ChatMessageGroupHandlers["onOpenSubagent"];
   onStopTool?: ChatMessageGroupHandlers["onStopTool"];
-  shouldShowWorkedFor: boolean;
 }) {
   const footerMessage = assistantFooterMessage(entries);
   const hasAnyToolCalls = entries.some(({ message }) => Boolean(message.toolCalls?.length));
@@ -111,6 +105,8 @@ const AssistantTurn = memo(function AssistantTurn({
   const rawActivityEntries = responseEntry ? entries.filter((_, index) => index !== responseIndex) : entries;
   const toolCalls = rawActivityEntries.flatMap(({ message }) => message.toolCalls ?? []);
   const hasToolCalls = toolCalls.length > 0;
+  const latestMessage = entries.at(-1)?.message;
+  const activeGenerationMessageID = isWorking && (latestMessage?.toolCalls?.length ?? 0) === 0 ? latestMessage?.id : undefined;
   const activityEntries = withActivityCheckpoints(rawActivityEntries, toolCalls);
   const [collapsedOverride, setCollapsedOverride] = useState<boolean | undefined>(undefined);
   const wasWorking = useRef(isWorking);
@@ -144,7 +140,7 @@ const AssistantTurn = memo(function AssistantTurn({
           return (
             <AssistantMessageBlock
               checkpoint={entry.checkpoint}
-              isWorking={isWorking}
+              isWorking={entry.message.id === activeGenerationMessageID}
               key={entry.message.id}
               message={entry.message}
               onOpenSubagent={actions.onOpenSubagent}
@@ -157,7 +153,7 @@ const AssistantTurn = memo(function AssistantTurn({
         {hasToolCalls ? (
           <ToolActivityCollapseControl
             isCollapsed={isToolActivityCollapsed}
-            isWorking={isWorking}
+            isWorking={activeGenerationMessageID !== undefined}
             onToggleCollapsed={toggleToolActivity}
             entries={activityEntries}
             thoughtFor={isToolActivityCollapsed ? aggregateThoughtFor(activityEntries) : undefined}
@@ -168,17 +164,17 @@ const AssistantTurn = memo(function AssistantTurn({
       {responseEntry ? (
         <AssistantMessageBlock
           checkpoint={responseEntry.checkpoint}
-          isWorking={isWorking}
+          isWorking={responseEntry.message.id === activeGenerationMessageID}
           message={responseEntry.message}
           onOpenSubagent={responseActions?.onOpenSubagent}
           onStopTool={responseActions?.onStopTool}
         />
       ) : null}
       <div className="chat-assistant-footer">
-        {shouldShowWorkedFor && (activeWorkedFor !== undefined || footerMessage.workedFor !== undefined) ? (
+        {(activeWorkedFor !== undefined || footerMessage.workedFor !== undefined) ? (
           <WorkedForCounter isLive={activeWorkedFor !== undefined} seconds={activeWorkedFor ?? footerMessage.workedFor!} />
         ) : null}
-        {shouldShowWorkedFor && activeWorkedFor !== undefined ? null : (
+        {activeWorkedFor !== undefined ? null : (
           <MessageFooter index={(responseEntry ?? activityEntries[activityEntries.length - 1]).index} message={footerMessage} />
         )}
       </div>
@@ -189,7 +185,6 @@ const AssistantTurn = memo(function AssistantTurn({
   && previous.startToolCallsCollapsed === next.startToolCallsCollapsed
   && previous.activeWorkedFor === next.activeWorkedFor
   && previous.isWorking === next.isWorking
-  && previous.shouldShowWorkedFor === next.shouldShowWorkedFor
   && previous.onOpenSubagent === next.onOpenSubagent
   && previous.onStopTool === next.onStopTool
   && previous.entries.length === next.entries.length

@@ -109,10 +109,10 @@ func (r *Runtime) runNestedWithConfig(ctx context.Context, cfg NestedRunConfig) 
 			return
 		}
 		agg := llm.AggregateConsecutiveTurnUsage(usageTurns)
-		ctxTok, usrTok, ctxEst, reasonTok, respTok, totalTok := llm.UsageTokensDisplayParts(usageSys, usageMsgs, agg, len(usageTurns))
-		fmt.Fprintln(streamOut, termcolor.UsageTokensLine(ctxTok, usrTok, reasonTok, respTok, totalTok, agg.OutputTPS, agg.TTFTSecs, agg.PromptTPS, ctxEst, agg.TurnWallSecs))
+		ctxTok, usrTok, ctxEst, reasonTok, respTok, totalTok := llm.UsageTokensDisplayParts(usageSys, usageMsgs, agg)
+		fmt.Fprintln(streamOut, termcolor.UsageTokensLine(ctxTok, usrTok, reasonTok, respTok, totalTok, agg.CachedPromptTokens, agg.CacheCreationPromptTokens, agg.OutputTPS, agg.TTFTSecs, agg.PromptTPS, ctxEst, agg.TurnWallSecs))
 		if !r.EphemeralSession {
-			chatstore.ApplyTurnUsageDisplayToLastSubAssistant(sess, ctxTok, usrTok, ctxEst, reasonTok, respTok, totalTok, agg.OutputTPS, agg.TTFTSecs, agg.PromptTPS, agg.TurnWallSecs)
+			chatstore.ApplyTurnUsageDisplayToLastSubAssistant(sess, ctxTok, usrTok, ctxEst, reasonTok, respTok, totalTok, agg.CachedPromptTokens, agg.CacheCreationPromptTokens, agg.OutputTPS, agg.TTFTSecs, agg.PromptTPS, agg.TurnWallSecs)
 			_ = r.persistSubSession(sess)
 		}
 		usageTurns = nil
@@ -131,6 +131,7 @@ func (r *Runtime) runNestedWithConfig(ctx context.Context, cfg NestedRunConfig) 
 		if cfg.RoleModel != "" {
 			provider, model = cfg.RoleProvider, cfg.RoleModel
 		}
+		fastMode := r.Cfg.FastModeEnabledForProvider(config.ProviderByName(r.Cfg, provider))
 		turn, legacySW, err := r.streamNestedAssistant(roundCtx, streamOut, system, msgs, r.subSessionImageFiles(sess), forceDisable, effort, cfg)
 		cancel()
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -188,7 +189,7 @@ func (r *Runtime) runNestedWithConfig(ctx context.Context, cfg NestedRunConfig) 
 		transcript.WriteString(turn.Content)
 		transcript.WriteByte('\n')
 		nestedCheckpointSeq++
-		ast := chatstore.Message{Provider: provider, Model: model, Role: "assistant", Content: turn.Content, ReasoningText: tooling.StripLegacyToolBlocks(strings.TrimSpace(turn.ReasoningText))}
+		ast := chatstore.Message{Provider: provider, Model: model, ReasoningEffort: effort, FastMode: &fastMode, CreatedAt: time.Now(), Role: "assistant", Content: turn.Content, ReasoningText: tooling.StripLegacyToolBlocks(strings.TrimSpace(turn.ReasoningText))}
 		stampNestedMessageCheckpoint(&ast, nestedCheckpointSeq)
 		ast.AnthropicThinking = turn.AnthropicThinking
 		for _, tc := range turn.ToolCalls {
@@ -278,6 +279,7 @@ func (r *Runtime) runNestedWithConfig(ctx context.Context, cfg NestedRunConfig) 
 		for i := range prepared {
 			execInvs[i] = prepared[i].inv
 		}
+		toolStartedAt := time.Now()
 		results := make([]toolbatch.Result, len(execInvs))
 		if len(execInvs) > 1 && len(turn.ToolCalls) > 1 && toolbatch.CanRunConcurrently(execInvs) {
 			// Execute the batch concurrently, but append nested tool results in
@@ -289,6 +291,17 @@ func (r *Runtime) runNestedWithConfig(ctx context.Context, cfg NestedRunConfig) 
 			}
 		}
 
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role == "assistant" {
+				msgs[i].ToolWallSecs += time.Since(toolStartedAt).Seconds()
+				break
+			}
+		}
+		sess.Messages = msgs
+		if !r.EphemeralSession {
+			_ = r.persistSubSession(sess)
+		}
+
 		for i := range prepared {
 			inv := prepared[i].inv
 			toolID := prepared[i].toolID
@@ -297,6 +310,11 @@ func (r *Runtime) runNestedWithConfig(ctx context.Context, cfg NestedRunConfig) 
 			if err != nil {
 				logging.Log(logging.WARNING_LOG_LEVEL, "nested tool execution failed", logging.LogOptions{Params: map[string]any{"tool": inv.Name, "err": err.Error()}})
 				res = map[string]any{"error": err.Error()}
+			}
+			if err == nil && chatstore.IsCapabilityTool(inv.Name) {
+				if payload, marshalErr := json.Marshal(res); marshalErr == nil {
+					sess.Capabilities.Capture(inv.Name, string(payload))
+				}
 			}
 			res = r.applyToolOutput(res, inv.Name, toolID)
 			b, err := json.Marshal(res)
