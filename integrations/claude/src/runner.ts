@@ -231,7 +231,7 @@ export class ClaudeRunner {
     while (!claim) {
       if (signal.aborted) throw new Error("Claude sidecar request cancelled");
       if (Date.now() >= deadline) throw new Error("Claude sidecar is at capacity: " + maxSessions + " conversations are running or waiting on tool results");
-      await this.changed(deadline);
+      await this.changed(deadline, signal);
       claim = this.claim(input);
     }
     const { session, action } = claim;
@@ -258,7 +258,7 @@ export class ClaudeRunner {
   // waiting on tool results. It returns null when the request has to wait for a free slot.
   private claim(input: { model: string; messages: ChatMessage[] }): { session: PoolSession; action: Action } | null {
     const now = Date.now();
-    for (const session of this.sessions.filter((entry) => !entry.busy && now - entry.used > idleMs)) void this.drop(session);
+    for (const session of this.sessions.filter((entry) => !entry.busy && !entry.awaitingTools && now - entry.used > idleMs)) void this.drop(session);
     for (const session of this.sessions) {
       if (session.busy || session.model !== input.model) continue;
       const action = nextAction(session.accepted, session.produced, input.messages);
@@ -279,10 +279,18 @@ export class ClaudeRunner {
     this.sessions.push(session);
     return { session, action };
   }
-  private changed(deadline: number) {
+  // Resolves on a pool change, the deadline, or cancellation, whichever comes first.
+  private changed(deadline: number, signal: AbortSignal) {
     return new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
-      this.waiters.push(() => { clearTimeout(timer); resolve(); });
+      const wake = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", wake);
+        this.waiters = this.waiters.filter((waiter) => waiter !== wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, Math.max(0, deadline - Date.now()));
+      signal.addEventListener("abort", wake, { once: true });
+      this.waiters.push(wake);
     });
   }
   private notify() {

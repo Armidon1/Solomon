@@ -14,6 +14,7 @@ import (
 	authclaude "github.com/SAPPHIR3-ROS3/Solomon/v2026/internal/auth/anthropic/claude"
 	"github.com/SAPPHIR3-ROS3/Solomon/v2026/internal/config"
 	"github.com/SAPPHIR3-ROS3/Solomon/v2026/internal/integrations/claude"
+	"github.com/gofrs/flock"
 )
 
 func TestClaudeSidecarSourcesResolveFromRepo(t *testing.T) {
@@ -42,8 +43,8 @@ func TestClaudeSidecarSourcesResolveFromRepo(t *testing.T) {
 func TestClaudeAccessTokenReadsCLICredentialsWithoutRefresh(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
-	if got := claude.AccessToken(); got != "" {
-		t.Fatalf("missing credentials token=%q", got)
+	if got, err := claude.AccessToken(t.Context()); got != "" || (runtime.GOOS != "darwin" && err == nil) {
+		t.Fatalf("missing credentials token=%q err=%v", got, err)
 	}
 	write := func(expires time.Time) {
 		body := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"cli-access","refreshToken":"cli-refresh","expiresAt":%d}}`, expires.UnixMilli())
@@ -52,12 +53,12 @@ func TestClaudeAccessTokenReadsCLICredentialsWithoutRefresh(t *testing.T) {
 		}
 	}
 	write(time.Now().Add(time.Hour))
-	if got := claude.AccessToken(); got != "cli-access" {
-		t.Fatalf("token=%q", got)
+	if got, err := claude.AccessToken(t.Context()); got != "cli-access" || err != nil {
+		t.Fatalf("token=%q err=%v", got, err)
 	}
 	write(time.Now().Add(-time.Hour))
-	if got := claude.AccessToken(); got != "" {
-		t.Fatalf("expired token=%q", got)
+	if got, err := claude.AccessToken(t.Context()); got != "" || err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired token=%q err=%v", got, err)
 	}
 }
 
@@ -69,6 +70,7 @@ func TestClaudeCLIStatusAndLoginUseSubscription(t *testing.T) {
 	state := filepath.Join(bin, "logged-in")
 	script := "#!/bin/sh\n" +
 		"[ -n \"$ANTHROPIC_API_KEY\" ] && { echo leaked >&2; exit 3; }\n" +
+		"[ -n \"$anthropic_api_key\" ] && { echo leaked >&2; exit 3; }\n" +
 		"case \"$1 $2\" in\n" +
 		"'auth status') if [ -f " + state + " ]; then echo '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"email\":\"a@b.c\"}'; else echo '{\"loggedIn\":false,\"authMethod\":\"none\"}'; exit 1; fi ;;\n" +
 		"'auth login') [ \"$3\" = --claudeai ] && : > " + state + " ;;\n" +
@@ -79,6 +81,8 @@ func TestClaudeCLIStatusAndLoginUseSubscription(t *testing.T) {
 	t.Setenv("PATH", bin)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("ANTHROPIC_API_KEY", "must-not-reach-cli")
+	// Windows reads environment names case-insensitively, so other spellings must not leak either.
+	t.Setenv("anthropic_api_key", "must-not-reach-cli")
 	status, err := claude.Status(t.Context())
 	if err != nil || status.Subscription() {
 		t.Fatalf("status=%+v err=%v", status, err)
@@ -103,5 +107,59 @@ func TestClaudeSubIsReadyWithoutSolomonTokens(t *testing.T) {
 	got := config.FilterClaudeSubModels([]string{"default", "opus", "claude-opus-5", "claude-opus-5", " claude-haiku-4-5 "})
 	if strings.Join(got, ",") != "claude-opus-5,claude-haiku-4-5" {
 		t.Fatalf("models=%v", got)
+	}
+}
+
+func TestClaudeRuntimeRetriesAFailedInstall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake npm is a shell script")
+	}
+	bin := t.TempDir()
+	runs := filepath.Join(bin, "runs")
+	// The fake npm leaves the SDK directory behind and fails on its first run, as an interrupted npm ci can.
+	script := "#!/bin/sh\n" +
+		"echo run >> " + runs + "\n" +
+		"mkdir -p node_modules/@anthropic-ai/claude-agent-sdk\n" +
+		"[ $(wc -l < " + runs + ") -gt 1 ] || exit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "npm"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+"/usr/bin:/bin")
+	t.Setenv("SOLOMON_NODE", filepath.Join(bin, "node"))
+	t.Setenv("SOLOMON_HOME", t.TempDir())
+	if _, err := claude.RuntimeDirForTest(t.Context()); err == nil {
+		t.Fatal("first install should fail")
+	}
+	for range 2 {
+		if _, err := claude.RuntimeDirForTest(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, _ := os.ReadFile(runs)
+	if got := strings.Count(string(data), "run"); got != 2 {
+		t.Fatalf("npm runs=%d, want a retry after the failure and none once installed", got)
+	}
+}
+
+func TestClaudeRuntimeLockHonorsCancellation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SOLOMON_HOME", home)
+	dir := filepath.Join(home, "integrations", "claude")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	held := flock.New(filepath.Join(dir, ".install.lock"))
+	if err := held.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer held.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := claude.RuntimeDirForTest(ctx); err == nil {
+		t.Fatal("expected a context error while another process holds the lock")
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("lock wait ignored cancellation for %s", waited)
 	}
 }

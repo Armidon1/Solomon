@@ -2,6 +2,7 @@ package claude
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -160,20 +161,23 @@ func Models(ctx context.Context, cwd string) ([]string, error) {
 }
 
 // AccessToken reads the CLI's current subscription token without refreshing it;
-// refresh tokens rotate, so only the CLI may spend them. It is empty when the CLI
-// keeps credentials elsewhere (for example the macOS keychain) or the token expired.
-func AccessToken() string {
+// refresh tokens rotate, so only the CLI may spend them. On macOS the CLI usually keeps
+// credentials in the login keychain rather than in the credentials file.
+func AccessToken(ctx context.Context) (string, error) {
 	dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
 	if dir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return ""
+			return "", err
 		}
 		dir = filepath.Join(home, ".claude")
 	}
 	data, err := os.ReadFile(filepath.Join(dir, ".credentials.json"))
+	if err != nil && runtime.GOOS == "darwin" {
+		data, err = keychainCredentials(ctx)
+	}
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("Claude CLI credentials are not readable: %w", err)
 	}
 	var creds struct {
 		OAuth struct {
@@ -181,13 +185,24 @@ func AccessToken() string {
 			ExpiresAt   int64  `json:"expiresAt"`
 		} `json:"claudeAiOauth"`
 	}
-	if json.Unmarshal(data, &creds) != nil {
-		return ""
+	if err := json.Unmarshal(data, &creds); err != nil || creds.OAuth.AccessToken == "" {
+		return "", fmt.Errorf("Claude CLI credentials hold no subscription token")
 	}
 	if creds.OAuth.ExpiresAt > 0 && time.Now().After(time.UnixMilli(creds.OAuth.ExpiresAt)) {
-		return ""
+		return "", fmt.Errorf("Claude CLI token expired; it refreshes on the next Claude Sub chat")
 	}
-	return creds.OAuth.AccessToken
+	return creds.OAuth.AccessToken, nil
+}
+
+// keychainCredentials reads the item the Claude CLI stores in the macOS login keychain.
+func keychainCredentials(ctx context.Context) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "security", "find-generic-password", "-s", "Claude Code-credentials", "-w").Output()
+	if err != nil {
+		return nil, fmt.Errorf("keychain: %w", err)
+	}
+	return bytes.TrimSpace(out), nil
 }
 
 func stopLocked() {
@@ -261,7 +276,10 @@ func sourceDir(ctx context.Context) (string, error) {
 		dir := start
 		for i := 0; i < 8; i++ {
 			candidate := filepath.Join(dir, "integrations", "claude")
-			if _, err := os.Stat(filepath.Join(candidate, "src", "index.ts")); err == nil {
+			// go.mod marks a checkout, so the extracted runtime cache under SOLOMON_HOME never
+			// matches here and upgrades always resync the embedded sources.
+			_, errMod := os.Stat(filepath.Join(dir, "go.mod"))
+			if _, err := os.Stat(filepath.Join(candidate, "src", "index.ts")); err == nil && errMod == nil {
 				return candidate, ensureModules(ctx, candidate)
 			}
 			parent := filepath.Dir(dir)

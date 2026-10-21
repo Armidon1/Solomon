@@ -70,3 +70,28 @@ test("a request fails with a capacity error when every session stays busy", asyn
   for (let index = 0; index < 8; index++) void ask(runner, [{ role: "user", content: "chat " + index }]);
   await assert.rejects(ask(runner, [{ role: "user", content: "title" }]), /at capacity/);
 });
+
+test("a cancelled request stops waiting for a slot at once", async () => {
+  const { runner } = pool({ gate: () => new Promise<void>(() => {}) });
+  for (let index = 0; index < 8; index++) void ask(runner, [{ role: "user", content: "chat " + index }]);
+  const controller = new AbortController();
+  const waiting = runner.complete({ model: "m", messages: [{ role: "user", content: "title" }], tools: [] }, () => {}, controller.signal);
+  const start = Date.now();
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(waiting, /cancelled/);
+  assert.ok(Date.now() - start < 1000, "the abort waited for the admission deadline");
+});
+
+test("idle expiry keeps conversations waiting on tool results", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { runner, created } = pool();
+  const chat: ChatMessage[] = [{ role: "user", content: "tool please" }];
+  const first = await ask(runner, chat);
+  await ask(runner, [{ role: "user", content: "plain" }]);
+  t.mock.timers.tick(31 * 60 * 1000);
+  await ask(runner, [{ role: "user", content: "later" }]);
+  assert.equal(created[0].closed, false, "the tool-waiting session expired");
+  assert.equal(created[1].closed, true, "the idle session should expire");
+  await ask(runner, [...chat, { role: "assistant", content: "", tool_calls: first.toolCalls }, { role: "tool", tool_call_id: first.toolCalls[0].id, content: "found" }]);
+  assert.deepEqual(created[0].actions.at(-1), { type: "tools", results: [{ id: "call-0", output: "found" }] });
+});
