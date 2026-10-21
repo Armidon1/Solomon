@@ -9,6 +9,7 @@ type Event = { kind: "sdk"; message: Record<string, any> } | { kind: "tool"; cal
 
 const maxSessions = 8;
 const idleMs = 30 * 60 * 1000;
+const admitTimeoutMs = 120 * 1000;
 
 class PushStream<T> {
   private items: T[] = [];
@@ -87,7 +88,18 @@ function user(prompt: string) { return { type: "user", message: { role: "user", 
 // LiveSession is one official SDK conversation. Like the Cursor sidecar's per-request agents,
 // sessions share no state, so title generation or a subagent never disturbs a chat that is
 // waiting on Solomon's tool results.
-class LiveSession {
+export type PoolSession = {
+  readonly model: string;
+  accepted: ChatMessage[];
+  produced: { content: string; tools: ToolCall[] } | null;
+  busy: boolean;
+  used: number;
+  readonly awaitingTools: boolean;
+  run(action: Action, tools: ToolDefinition[], onDelta: (text: string) => void, signal: AbortSignal): Promise<Completion>;
+  close(): Promise<void>;
+};
+
+class LiveSession implements PoolSession {
   readonly model: string;
   accepted: ChatMessage[] = [];
   produced: { content: string; tools: ToolCall[] } | null = null;
@@ -103,7 +115,10 @@ class LiveSession {
     this.executable = executable;
     this.model = model;
   }
-  async complete(action: Action, messages: ChatMessage[], tools: ToolDefinition[], onDelta: (text: string) => void, signal: AbortSignal): Promise<Completion> {
+  // awaitingTools is true while SDK tool callbacks wait for Solomon's results; closing the
+  // session then would answer them with empty output and lose the round.
+  get awaitingTools() { return this.pending.size > 0; }
+  async run(action: Action, tools: ToolDefinition[], onDelta: (text: string) => void, signal: AbortSignal): Promise<Completion> {
     if (action.type === "reject") throw new Error(action.reason);
     if (action.type === "start") this.start(action.system, action.prompt, tools);
     if (action.type === "user") this.input.push(user(action.prompt));
@@ -115,10 +130,7 @@ class LiveSession {
         resolve(result.output);
       }
     }
-    const completion = await this.read(onDelta, signal);
-    this.accepted = messages;
-    this.produced = { content: completion.content, tools: completion.toolCalls };
-    return completion;
+    return this.read(onDelta, signal);
   }
   private start(system: string, prompt: string, tools: ToolDefinition[]) {
     const definitions = tools.flatMap((entry) => {
@@ -180,11 +192,23 @@ class LiveSession {
   }
 }
 
+export type RunnerOptions = {
+  createSession?: (model: string) => PoolSession;
+  admitTimeoutMs?: number;
+};
+
 export class ClaudeRunner {
   private executable: string;
-  private sessions: LiveSession[] = [];
+  private sessions: PoolSession[] = [];
   private modelNames: string[] | null = null;
-  constructor(executable: string) { this.executable = executable; }
+  private createSession: (model: string) => PoolSession;
+  private admitTimeoutMs: number;
+  private waiters: Array<() => void> = [];
+  constructor(executable: string, opts: RunnerOptions = {}) {
+    this.executable = executable;
+    this.createSession = opts.createSession || ((model) => new LiveSession(executable, model));
+    this.admitTimeoutMs = opts.admitTimeoutMs ?? admitTimeoutMs;
+  }
   async models(): Promise<string[]> {
     if (this.modelNames) return this.modelNames;
     const input = new PushStream<Record<string, unknown>>();
@@ -202,47 +226,75 @@ export class ClaudeRunner {
     }
   }
   async complete(input: { model: string; messages: ChatMessage[]; tools: ToolDefinition[] }, onDelta: (text: string) => void, signal: AbortSignal): Promise<Completion> {
-    await this.sweep();
-    let session: LiveSession | undefined;
-    let action: Action = nextAction([], null, input.messages);
-    for (const candidate of this.sessions) {
-      if (candidate.busy || candidate.model !== input.model) continue;
-      const next = nextAction(candidate.accepted, candidate.produced, input.messages);
-      if (next.type !== "reject") {
-        session = candidate;
-        action = next;
-        break;
-      }
+    const deadline = Date.now() + this.admitTimeoutMs;
+    let claim = this.claim(input);
+    while (!claim) {
+      if (signal.aborted) throw new Error("Claude sidecar request cancelled");
+      if (Date.now() >= deadline) throw new Error("Claude sidecar is at capacity: " + maxSessions + " conversations are running or waiting on tool results");
+      await this.changed(deadline);
+      claim = this.claim(input);
     }
-    if (action.type === "reject") throw new Error(action.reason);
-    if (!session) {
-      session = new LiveSession(this.executable, input.model);
-      this.sessions.push(session);
-    }
-    // Claimed before any await, so concurrent requests never share a session.
-    session.busy = true;
+    const { session, action } = claim;
     try {
-      return await session.complete(action, input.messages, input.tools, onDelta, signal);
+      const completion = await session.run(action, input.tools, onDelta, signal);
+      session.accepted = input.messages;
+      session.produced = { content: completion.content, tools: completion.toolCalls };
+      return completion;
     } catch (error) {
       await this.drop(session);
       throw error;
     } finally {
       session.busy = false;
       session.used = Date.now();
+      this.notify();
     }
   }
   async close() {
     await Promise.all(this.sessions.map((session) => this.drop(session)));
   }
-  // sweep closes idle sessions and keeps the pool bounded, since each one holds a CLI process.
-  private async sweep() {
+  // claim matches and reserves a session synchronously, so concurrent requests never share one
+  // and the pool never exceeds maxSessions. It reuses the session whose history the request
+  // extends before evicting anything, and only evicts sessions that are neither running nor
+  // waiting on tool results. It returns null when the request has to wait for a free slot.
+  private claim(input: { model: string; messages: ChatMessage[] }): { session: PoolSession; action: Action } | null {
     const now = Date.now();
-    for (const session of this.sessions.filter((entry) => !entry.busy && now - entry.used > idleMs)) await this.drop(session);
-    const idle = this.sessions.filter((entry) => !entry.busy).sort((left, right) => left.used - right.used);
-    while (this.sessions.length >= maxSessions && idle.length) await this.drop(idle.shift()!);
+    for (const session of this.sessions.filter((entry) => !entry.busy && now - entry.used > idleMs)) void this.drop(session);
+    for (const session of this.sessions) {
+      if (session.busy || session.model !== input.model) continue;
+      const action = nextAction(session.accepted, session.produced, input.messages);
+      if (action.type !== "reject") {
+        session.busy = true;
+        return { session, action };
+      }
+    }
+    const action = nextAction([], null, input.messages);
+    if (action.type === "reject") throw new Error(action.reason);
+    if (this.sessions.length >= maxSessions) {
+      const victim = this.sessions.filter((entry) => !entry.busy && !entry.awaitingTools).sort((left, right) => left.used - right.used)[0];
+      if (!victim) return null;
+      void this.drop(victim);
+    }
+    const session = this.createSession(input.model);
+    session.busy = true;
+    this.sessions.push(session);
+    return { session, action };
   }
-  private async drop(session: LiveSession) {
+  private changed(deadline: number) {
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+      this.waiters.push(() => { clearTimeout(timer); resolve(); });
+    });
+  }
+  private notify() {
+    const waiters = this.waiters;
+    this.waiters = [];
+    for (const wake of waiters) wake();
+  }
+  // drop removes the session synchronously, so callers can free its slot without awaiting the CLI.
+  private async drop(session: PoolSession) {
+    if (!this.sessions.includes(session)) return;
     this.sessions = this.sessions.filter((entry) => entry !== session);
+    this.notify();
     await session.close();
   }
 }

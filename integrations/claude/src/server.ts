@@ -77,7 +77,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, token: string, 
     res.end("data: [DONE]\n\n");
   } catch (error) {
     const message = error instanceof Error ? error.message : "Claude sidecar request failed";
-    const status = message.includes("diverged") || message.includes("cannot import") || message.includes("unsupported content") ? 409 : 502;
+    const status = message.includes("diverged") || message.includes("cannot import") || message.includes("unsupported content") ? 409 : message.includes("at capacity") ? 503 : 502;
     if (!res.headersSent) send(res, status, { error: { message } });
     else res.end();
   }
