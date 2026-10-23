@@ -173,7 +173,7 @@ func AccessToken(ctx context.Context) (string, error) {
 		dir = filepath.Join(home, ".claude")
 	}
 	data, err := os.ReadFile(filepath.Join(dir, ".credentials.json"))
-	if err != nil && runtime.GOOS == "darwin" {
+	if err != nil && keychainCredentials != nil {
 		data, err = keychainCredentials(ctx)
 	}
 	if err != nil {
@@ -194,8 +194,24 @@ func AccessToken(ctx context.Context) (string, error) {
 	return creds.OAuth.AccessToken, nil
 }
 
-// keychainCredentials reads the item the Claude CLI stores in the macOS login keychain.
-func keychainCredentials(ctx context.Context) ([]byte, error) {
+// keychainCredentials reads the item the Claude CLI stores in the macOS login keychain;
+// it is nil elsewhere, and tests replace it so they never touch a real login.
+var keychainCredentials func(ctx context.Context) ([]byte, error)
+
+func init() {
+	if runtime.GOOS == "darwin" {
+		keychainCredentials = readKeychain
+	}
+}
+
+// SetKeychainForTest replaces the keychain reader and returns a function that restores it.
+func SetKeychainForTest(read func(ctx context.Context) ([]byte, error)) (restore func()) {
+	previous := keychainCredentials
+	keychainCredentials = read
+	return func() { keychainCredentials = previous }
+}
+
+func readKeychain(ctx context.Context) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "security", "find-generic-password", "-s", "Claude Code-credentials", "-w").Output()

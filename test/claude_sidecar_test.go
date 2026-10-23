@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -43,8 +44,20 @@ func TestClaudeSidecarSourcesResolveFromRepo(t *testing.T) {
 func TestClaudeAccessTokenReadsCLICredentialsWithoutRefresh(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
-	if got, err := claude.AccessToken(t.Context()); got != "" || (runtime.GOOS != "darwin" && err == nil) {
-		t.Fatalf("missing credentials token=%q err=%v", got, err)
+	// Never reach the real macOS keychain, and never print token values in failures.
+	keychain := []byte(nil)
+	defer claude.SetKeychainForTest(func(context.Context) ([]byte, error) {
+		if keychain == nil {
+			return nil, errors.New("no keychain item")
+		}
+		return keychain, nil
+	})()
+	if got, err := claude.AccessToken(t.Context()); got != "" || err == nil {
+		t.Fatalf("missing credentials returned a token=%t err=%v", got != "", err)
+	}
+	keychain = []byte(`{"claudeAiOauth":{"accessToken":"keychain-access"}}`)
+	if got, err := claude.AccessToken(t.Context()); got != "keychain-access" || err != nil {
+		t.Fatalf("keychain fallback matched=%t err=%v", got == "keychain-access", err)
 	}
 	write := func(expires time.Time) {
 		body := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"cli-access","refreshToken":"cli-refresh","expiresAt":%d}}`, expires.UnixMilli())
@@ -54,11 +67,11 @@ func TestClaudeAccessTokenReadsCLICredentialsWithoutRefresh(t *testing.T) {
 	}
 	write(time.Now().Add(time.Hour))
 	if got, err := claude.AccessToken(t.Context()); got != "cli-access" || err != nil {
-		t.Fatalf("token=%q err=%v", got, err)
+		t.Fatalf("credentials file matched=%t err=%v", got == "cli-access", err)
 	}
 	write(time.Now().Add(-time.Hour))
 	if got, err := claude.AccessToken(t.Context()); got != "" || err == nil || !strings.Contains(err.Error(), "expired") {
-		t.Fatalf("expired token=%q err=%v", got, err)
+		t.Fatalf("expired credentials returned a token=%t err=%v", got != "", err)
 	}
 }
 
@@ -120,6 +133,7 @@ func TestClaudeRuntimeRetriesAFailedInstall(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		"echo run >> " + runs + "\n" +
 		"mkdir -p node_modules/@anthropic-ai/claude-agent-sdk\n" +
+		"touch node_modules/@anthropic-ai/claude-agent-sdk/package.json\n" +
 		"[ $(wc -l < " + runs + ") -gt 1 ] || exit 1\n"
 	if err := os.WriteFile(filepath.Join(bin, "npm"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -138,6 +152,21 @@ func TestClaudeRuntimeRetriesAFailedInstall(t *testing.T) {
 	data, _ := os.ReadFile(runs)
 	if got := strings.Count(string(data), "run"); got != 2 {
 		t.Fatalf("npm runs=%d, want a retry after the failure and none once installed", got)
+	}
+	// A valid stamp must not hide dependencies removed after the install.
+	dir, err := claude.RuntimeDirForTest(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "node_modules")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claude.RuntimeDirForTest(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(runs)
+	if got := strings.Count(string(data), "run"); got != 3 {
+		t.Fatalf("npm runs=%d, want a reinstall after node_modules was removed", got)
 	}
 }
 

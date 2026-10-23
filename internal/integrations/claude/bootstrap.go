@@ -69,7 +69,9 @@ func runtimeDir(ctx context.Context) (string, error) {
 	sum := sha256.Sum256(lockfile)
 	want := hex.EncodeToString(sum[:])
 	stamp := filepath.Join(dir, ".installed")
-	if current, err := os.ReadFile(stamp); err == nil && strings.TrimSpace(string(current)) == want {
+	// The stamp proves npm ci once succeeded; the SDK check catches node_modules removed since.
+	_, sdkErr := os.Stat(filepath.Join(dir, "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json"))
+	if current, err := os.ReadFile(stamp); err == nil && strings.TrimSpace(string(current)) == want && sdkErr == nil {
 		return dir, nil
 	}
 	// The stamp is written only after npm ci succeeds, so a failed or interrupted install is retried
