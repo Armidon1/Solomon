@@ -1,6 +1,8 @@
 package chat
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 )
@@ -25,6 +27,9 @@ func ChatCompletionToCodexBody(chat map[string]any) ([]byte, error) {
 	}
 	if serviceTier, ok := chat["service_tier"].(string); ok && strings.TrimSpace(serviceTier) != "" {
 		body["service_tier"] = strings.TrimSpace(serviceTier)
+	}
+	if cacheKey, ok := chat["prompt_cache_key"].(string); ok && strings.TrimSpace(cacheKey) != "" {
+		body["prompt_cache_key"] = strings.TrimSpace(cacheKey)
 	}
 	if tc, ok := chat["tool_choice"]; ok && tc != nil {
 		body["tool_choice"] = tc
@@ -111,6 +116,11 @@ func BuildCodexInput(chat map[string]any) []any {
 				"type": "message", "role": "user", "content": contents,
 			})
 		case "assistant":
+			if enc, _ := mm["reasoning_encrypted_content"].(string); strings.TrimSpace(enc) != "" {
+				input = append(input, map[string]any{
+					"type": "reasoning", "encrypted_content": strings.TrimSpace(enc),
+				})
+			}
 			texts := collectTextSegments(mm["content"], false)
 			if len(texts) > 0 {
 				contents := make([]any, 0, len(texts))
@@ -134,7 +144,7 @@ func BuildCodexInput(chat map[string]any) []any {
 					funcMap, _ := tcm["function"].(map[string]any)
 					name, _ := funcMap["name"].(string)
 					input = append(input, map[string]any{
-						"type": "function_call", "name": name, "call_id": callID,
+						"type": "function_call", "name": name, "call_id": codexCallID(callID),
 						"arguments": extractArgumentsString(funcMap["arguments"]),
 					})
 				}
@@ -145,12 +155,22 @@ func BuildCodexInput(chat map[string]any) []any {
 				continue
 			}
 			input = append(input, map[string]any{
-				"type": "function_call_output", "call_id": callID,
+				"type": "function_call_output", "call_id": codexCallID(callID),
 				"output": collectToolOutput(mm["content"]),
 			})
 		}
 	}
 	return input
+}
+
+// Keep historical tool IDs compatible with the Responses API while preserving
+// the association between each call and its output. Do not alter stored history.
+func codexCallID(id string) string {
+	if len(id) <= 64 {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:])
 }
 
 func mapToolsToCodex(chat map[string]any) []any {

@@ -114,6 +114,8 @@ func (r *chatRun) Emit(ev cievents.Event) {
 
 	for _, subscriber := range subscribers {
 		select {
+		case <-r.ctx.Done():
+			return
 		case subscriber.sub.events <- value:
 		case <-subscriber.sub.ctx.Done():
 			r.unsubscribe(subscriber.id)
@@ -218,22 +220,24 @@ type apiChat struct {
 }
 
 type apiMessage struct {
-	CreatedAt        string               `json:"createdAt,omitempty"`
-	CheckpointBranch string               `json:"checkpointBranch,omitempty"`
-	CheckpointSeq    *int                 `json:"checkpointSeq,omitempty"`
-	Content          string               `json:"content"`
-	ID               string               `json:"id"`
-	Images           []apiImage           `json:"images,omitempty"`
-	Kind             string               `json:"kind,omitempty"`
-	Reasoning        string               `json:"reasoning,omitempty"`
-	RetainedMessages []apiRetainedMessage `json:"retainedMessages,omitempty"`
-	Role             string               `json:"role"`
-	Stats            *apiStats            `json:"stats,omitempty"`
-	Status           string               `json:"status,omitempty"`
-	Summary          string               `json:"summary,omitempty"`
-	ThoughtFor       float64              `json:"thoughtFor,omitempty"`
-	ToolCalls        []apiToolCall        `json:"toolCalls,omitempty"`
-	WorkedFor        float64              `json:"workedFor,omitempty"`
+	FileChangesRecorded bool                          `json:"fileChangesRecorded,omitempty"`
+	FileChanges         []chatstore.FileChangeSummary `json:"fileChanges,omitempty"`
+	CreatedAt           string                        `json:"createdAt,omitempty"`
+	CheckpointBranch    string                        `json:"checkpointBranch,omitempty"`
+	CheckpointSeq       *int                          `json:"checkpointSeq,omitempty"`
+	Content             string                        `json:"content"`
+	ID                  string                        `json:"id"`
+	Images              []apiImage                    `json:"images,omitempty"`
+	Kind                string                        `json:"kind,omitempty"`
+	Reasoning           string                        `json:"reasoning,omitempty"`
+	RetainedMessages    []apiRetainedMessage          `json:"retainedMessages,omitempty"`
+	Role                string                        `json:"role"`
+	Stats               *apiStats                     `json:"stats,omitempty"`
+	Status              string                        `json:"status,omitempty"`
+	Summary             string                        `json:"summary,omitempty"`
+	ThoughtFor          float64                       `json:"thoughtFor,omitempty"`
+	ToolCalls           []apiToolCall                 `json:"toolCalls,omitempty"`
+	WorkedFor           float64                       `json:"workedFor,omitempty"`
 }
 
 type apiRetainedMessage struct {
@@ -1285,6 +1289,8 @@ func apiMessageFromSession(projectID, ownerID string, message chatstore.Message,
 		value.CreatedAt = message.CreatedAt.Local().Format(time.RFC3339Nano)
 	}
 	if role == "assistant" {
+		value.FileChanges = message.FileChanges
+		value.FileChangesRecorded = message.FileChangesRecorded
 		value.Reasoning = reasoning
 		value.ToolCalls = apiToolCallsFromMessage(projectID, ownerID, source, index, runActive, true)
 		value.Stats = apiStatsForMessageTurn(message, source, index)
@@ -1448,7 +1454,7 @@ func messageToolWallSeconds(message chatstore.Message, source []chatstore.Messag
 }
 
 func apiStatsFromMessage(message chatstore.Message) *apiStats {
-	if message.Provider == "" && message.Model == "" && message.ReasoningEffort == "" && !message.TurnDisplaySaved && message.PromptTokens == 0 && message.CachedPromptTokens == 0 && message.CacheCreationPromptTokens == 0 && message.UserPromptTokens == 0 && message.ReasoningTokens == 0 && message.ResponseTokens == 0 && message.TurnTotalTokens == 0 && message.TurnWallSecs == 0 {
+	if message.Provider == "" && message.Model == "" && message.ReasoningEffort == "" && !message.CacheUsageTracked && !message.TurnDisplaySaved && message.PromptTokens == 0 && message.CachedPromptTokens == 0 && message.CacheCreationPromptTokens == 0 && message.UserPromptTokens == 0 && message.ReasoningTokens == 0 && message.ResponseTokens == 0 && message.TurnTotalTokens == 0 && message.TurnWallSecs == 0 {
 		return nil
 	}
 	contextTokens := message.TurnContextTokens
@@ -1459,12 +1465,12 @@ func apiStatsFromMessage(message chatstore.Message) *apiStats {
 	if userTokens == 0 {
 		userTokens = message.UserPromptTokens
 	}
-	cachedPromptTokens := message.CachedPromptTokens
-	if message.TurnCachedPromptTokens > 0 {
+	cachedPromptTokens := chatstore.CacheTokenCount(message.CachedPromptTokens, message.CacheUsageTracked)
+	if message.TurnDisplaySaved && (message.CacheUsageTracked || message.TurnCachedPromptTokens != 0) {
 		cachedPromptTokens = message.TurnCachedPromptTokens
 	}
-	cacheCreationPromptTokens := message.CacheCreationPromptTokens
-	if message.TurnCacheCreationPromptTokens > 0 {
+	cacheCreationPromptTokens := chatstore.CacheTokenCount(message.CacheCreationPromptTokens, message.CacheUsageTracked)
+	if message.TurnDisplaySaved && (message.CacheUsageTracked || message.TurnCacheCreationPromptTokens != 0) {
 		cacheCreationPromptTokens = message.TurnCacheCreationPromptTokens
 	}
 	reasoningTokens := message.TurnReasonTokens

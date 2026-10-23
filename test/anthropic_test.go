@@ -17,8 +17,8 @@ func TestMessagesForAPI_OnlyLastAssistantKeepsReasoning(t *testing.T) {
 		{Role: "assistant", Content: "a2", ReasoningText: "think2"},
 	}
 	api := llm.MessagesForAPI(msgs)
-	if api[0].ReasoningText != "" {
-		t.Fatalf("first assistant should strip reasoning, got %q", api[0].ReasoningText)
+	if api[0].ReasoningText != "think1" {
+		t.Fatalf("earlier assistant reasoning must stay in the cached prefix, got %q", api[0].ReasoningText)
 	}
 	if api[2].ReasoningText != "think2" {
 		t.Fatalf("last assistant should keep reasoning, got %q", api[2].ReasoningText)
@@ -49,8 +49,8 @@ func TestNormalizeAnthropicUsage(t *testing.T) {
 		CacheReadInputTokens:     30,
 		CacheCreationInputTokens: 10,
 	})
-	if u.PromptTokens != 130 {
-		t.Fatalf("prompt tokens: got %d want 130", u.PromptTokens)
+	if u.PromptTokens != 140 {
+		t.Fatalf("prompt tokens: got %d want 140", u.PromptTokens)
 	}
 	if u.CachedPromptTokens != 30 {
 		t.Fatalf("cached: got %d want 30", u.CachedPromptTokens)

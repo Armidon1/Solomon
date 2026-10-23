@@ -2,10 +2,44 @@ package test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	codexchat "github.com/SAPPHIR3-ROS3/Solomon/v2026/internal/auth/openai/codex/chat"
 )
+
+func TestBuildCodexInputLongCallIDs(t *testing.T) {
+	prefix := strings.Repeat("a", 64)
+	ids := []string{"call_short", prefix, prefix + strings.Repeat("b", 19), prefix + strings.Repeat("c", 19)}
+	var messages []any
+	for _, id := range ids {
+		messages = append(messages,
+			map[string]any{"role": "assistant", "tool_calls": []any{
+				map[string]any{"id": id, "function": map[string]any{"name": "shell", "arguments": "{}"}},
+			}},
+			map[string]any{"role": "tool", "tool_call_id": id, "content": "done"},
+		)
+	}
+	input := codexchat.BuildCodexInput(map[string]any{"messages": messages})
+	if len(input) != 2*len(ids) {
+		t.Fatalf("unexpected input count: %d", len(input))
+	}
+	seen := map[string]bool{}
+	for i, original := range ids {
+		call := input[2*i].(map[string]any)["call_id"].(string)
+		output := input[2*i+1].(map[string]any)["call_id"].(string)
+		if len(call) > 64 || call != output || seen[call] {
+			t.Fatalf("invalid call/output mapping: %q / %q", call, output)
+		}
+		if len(original) <= 64 && call != original {
+			t.Fatalf("valid ID changed: %q", original)
+		}
+		seen[call] = true
+	}
+	if messages[4].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["id"] != ids[2] {
+		t.Fatal("stored history was modified")
+	}
+}
 
 func TestBuildCodexInputUserImages(t *testing.T) {
 	imgURL := "data:image/png;base64,abc"
@@ -55,8 +89,8 @@ func TestBuildCodexInputSkipsAssistantToolCallsWithEmptyID(t *testing.T) {
 				"role": "assistant",
 				"tool_calls": []any{
 					map[string]any{
-						"id": "",
-						"type": "function",
+						"id":       "",
+						"type":     "function",
 						"function": map[string]any{"name": "shell", "arguments": "{}"},
 					},
 				},
@@ -72,6 +106,23 @@ func TestBuildCodexInputSkipsAssistantToolCallsWithEmptyID(t *testing.T) {
 		if m["type"] == "function_call" {
 			t.Fatalf("unexpected function_call with empty id: %#v", m)
 		}
+	}
+}
+
+func TestBuildCodexInputReplaysEncryptedReasoning(t *testing.T) {
+	chat := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "go"},
+			map[string]any{"role": "assistant", "content": "done", "reasoning_encrypted_content": "enc-1"},
+		},
+	}
+	input := codexchat.BuildCodexInput(chat)
+	if len(input) != 3 {
+		t.Fatalf("want user, reasoning, assistant; got %#v", input)
+	}
+	reasoning, _ := input[1].(map[string]any)
+	if reasoning["type"] != "reasoning" || reasoning["encrypted_content"] != "enc-1" {
+		t.Fatalf("reasoning item: %#v", input[1])
 	}
 }
 
@@ -91,6 +142,7 @@ func TestBuildCodexInputImageOnlyUserMessage(t *testing.T) {
 	if len(input) != 1 {
 		t.Fatalf("want image-only user message preserved, got %d items", len(input))
 	}
+	chat["prompt_cache_key"] = " chat-1 "
 	body, err := codexchat.ChatCompletionToCodexBody(chat)
 	if err != nil {
 		t.Fatal(err)
@@ -98,6 +150,9 @@ func TestBuildCodexInputImageOnlyUserMessage(t *testing.T) {
 	var decoded map[string]any
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		t.Fatal(err)
+	}
+	if decoded["prompt_cache_key"] != "chat-1" {
+		t.Fatalf("prompt_cache_key: %#v", decoded["prompt_cache_key"])
 	}
 	rawInput, ok := decoded["input"].([]any)
 	if !ok || len(rawInput) != 1 {

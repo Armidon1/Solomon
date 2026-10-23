@@ -12,6 +12,7 @@ export type ChatStats = {
   provider?: string;
   model?: string;
   contextTokens: number;
+  /** -1 (or absent) means the provider did not report this counter. */
   cachedPromptTokens?: number;
   cacheCreationPromptTokens?: number;
   outputTokensPerSecond: number;
@@ -92,7 +93,17 @@ export type ChatClip = {
   text: string;
 };
 
+export type ChatFileChange = {
+  path: string;
+  added: number;
+  removed: number;
+  binary?: boolean;
+  addedLines?: string[];
+  removedLines?: string[];
+};
+
 export type ChatMessage = {
+  fileChanges?: ChatFileChange[];
   checkpointBranch?: string;
   checkpointSeq?: number;
   clips?: ChatClip[];

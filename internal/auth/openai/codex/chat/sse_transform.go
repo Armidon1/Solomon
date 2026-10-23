@@ -90,6 +90,16 @@ func (t *sseTransformer) transform(dataLine []byte) (out []byte, done bool, err 
 		return bytes.Join(chunks, []byte("\n")), false, nil
 	}
 	switch eventType {
+	case "error", "response.failed", "response.incomplete":
+		payload := trimmed
+		if response, ok := upstream["response"].(map[string]any); ok {
+			if details, ok := response["incomplete_details"]; ok && response["error"] == nil {
+				encoded, _ := json.Marshal(details)
+				return nil, false, fmt.Errorf("ChatGPT Sub: %s: %s", eventType, encoded)
+			}
+			payload, _ = json.Marshal(response)
+		}
+		return nil, false, fmt.Errorf("%s: %w", eventType, ChatGPTSubUpstreamError(502, payload, t.model))
 	case "response.created":
 		if resp, ok := upstream["response"].(map[string]any); ok {
 			if id, ok := resp["id"].(string); ok {
@@ -97,6 +107,34 @@ func (t *sseTransformer) transform(dataLine []byte) (out []byte, done bool, err 
 			}
 		}
 		return nil, false, nil
+	case "response.output_item.done":
+		item, _ := upstream["item"].(map[string]any)
+		if item == nil || item["type"] != "reasoning" {
+			return nil, false, nil
+		}
+		enc, _ := item["encrypted_content"].(string)
+		enc = strings.TrimSpace(enc)
+		if enc == "" {
+			return nil, false, nil
+		}
+		var chunks [][]byte
+		if rb, err := sendRole(upstream["sequence_number"]); err != nil {
+			return nil, false, err
+		} else if len(rb) > 0 {
+			chunks = append(chunks, rb)
+		}
+		chunk := map[string]any{
+			"id": t.responseID, "object": "chat.completion.chunk", "created": upstream["sequence_number"], "model": t.model,
+			"choices": []any{map[string]any{
+				"index": 0, "delta": map[string]any{"reasoning_encrypted_content": enc}, "finish_reason": nil,
+			}},
+		}
+		b, err := json.Marshal(chunk)
+		if err != nil {
+			return nil, false, err
+		}
+		chunks = append(chunks, b)
+		return bytes.Join(chunks, []byte("\n")), false, nil
 	case "response.output_item.added":
 		item, _ := upstream["item"].(map[string]any)
 		if item == nil || item["type"] != "function_call" {
